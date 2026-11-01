@@ -1,0 +1,9 @@
+Package: ru.danpashin.mldec
+Name: MLDecrypt
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: An awesome tool of some sort!!
+Maintainer: danpashin
+Author: danpashin
+Section: System
+Tag: role::hacker
