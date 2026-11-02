@@ -17,18 +17,9 @@ extension URL {
         self.modelUrl = (modelUrl as NSURL).resolvingSymlinksInPath!
 
         let cryptInfoURL = modelUrl.appendingPathComponent("encryptionInfo").appendingPathComponent("coremldata.bin")
-        let cryptInfo = try FileHandle(forReadingFrom: cryptInfoURL)
 
-        try cryptInfo.seek(toOffset: 0x60)
-        let keyIDLenData = try cryptInfo.read(upToCount: 8)!
-
-        var keyIDLen: Int = 0
-        _ = withUnsafeMutableBytes(of: &keyIDLen) { buf in
-            keyIDLenData.copyBytes(to: buf, count: 8)
-        }
-
-        let keyID = try cryptInfo.read(upToCount: keyIDLen)!
-        self.cryptKeyID = String(data: keyID, encoding: .utf8)!
+        let cryptInfo = try MLEncryptionInfo(path: cryptInfoURL.path)
+        self.cryptKeyID = cryptInfo.keyID
     }
 
     func decrypt(teamID: String, to outURL: URL) throws {
@@ -36,18 +27,20 @@ extension URL {
         try manager.startDecryptionOfModel(atPath: modelUrl.path, usingKeyBlob: keyBlob, teamIdentifier: teamID)
         defer { manager.stopDecryptionOfModel(atPath: modelUrl.path) }
 
+        print("Using \(teamID) and \(cryptKeyID)...")
+
         let outDir = (outURL as NSURL).resolvingSymlinksInPath!.appendingPathComponent(modelUrl.lastPathComponent)
         if outDir == modelUrl {
             fatalError("Target dir can't be the same as source")
         }
+        let targetModelURL = outDir.appendingPathComponent(modelUrl.lastPathComponent, isDirectory: true)
 
         let fm = FileManager.default
 
-        let enumerator = fm.enumerator(at: modelUrl, includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey])!
-        for case let fileURL as URL in enumerator {
-            let sourceURL = (fileURL as NSURL).resolvingSymlinksInPath!
+        for case let relFilePath as String in fm.enumerator(atPath: modelUrl.path)! {
+            let sourceURL = modelUrl.appendingPathComponent(relFilePath)
 
-            let fileAttributes = try sourceURL.resourceValues(forKeys:[.isRegularFileKey, .fileSizeKey])
+            let fileAttributes = try sourceURL.resourceValues(forKeys:[.isRegularFileKey])
             if !fileAttributes.isRegularFile! {
                 continue
             }
@@ -56,41 +49,22 @@ extension URL {
                 continue
             }
 
-            let size = fileAttributes.fileSize!
-            if size <= 0x50 {
-                print("Can't process \(sourceURL.path) as it is not a valid DB")
-                continue
+            do {
+                let file = try MLEncryptedFile(path: sourceURL.path)
+                try file.decrypt()
+
+                let targetFileURL = outDir.appendingPathComponent(relFilePath)
+                try fm.createDirectory(at: targetFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+                try file.data.write(to: targetFileURL)
+
+                print("Decrypted \(sourceURL.path)")
+            } catch {
+                print("\(sourceURL.path) failed with error: \(error)")
+
+                try? fm.removeItem(at: targetModelURL)
+                break
             }
-
-            guard let sourceHandle = try? FileHandle(forReadingFrom: sourceURL),
-                  let fileData = mmap(nil, size, 1, 2, sourceHandle.fileDescriptor, 0),
-                  fileData != UnsafeMutableRawPointer(bitPattern: -1)
-            else {
-                print("Can't mmap \(sourceURL.path)")
-                continue
-            }
-
-            defer { munmap(fileData, size) }
-
-            let targetURL = outDir.appendingPathComponent(sourceURL.relativePath(to: modelUrl))
-            try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-            let encryptedPages = fileData.load(fromByteOffset: 0x10, as: Int8.self)
-            if encryptedPages == 0 {
-                print("\(sourceURL.path) is not encrypted")
-                try fm.copyItem(at: sourceURL, to: targetURL)
-                continue
-            }
-
-            if mremap_encrypted(fileData, size, 0x2, 0xABCD, 0) != 0 {
-                print("Remap for \(sourceURL.path) failed")
-                continue
-            }
-
-            let decryptedData = NSData(bytesNoCopy: fileData, length: size, freeWhenDone: false)
-            try decryptedData.write(to: targetURL)
-
-            print("Decrypted \(sourceURL.path)")
         }
     }
 
@@ -111,5 +85,113 @@ extension URL {
         try MLPersistentKeyStorage.storeKeyBlob(keyBlob, forKeyIdentifier: cryptKeyID)
 
         return keyBlob
+    }
+}
+
+class MLEncryptedFile: CustomStringConvertible {
+    static let MIN_SIZE: Int8 = 64
+
+    private let fd: Int32
+
+    let origContents: UnsafeMutableRawBufferPointer
+    let remappedContents: UnsafeMutableRawBufferPointer
+
+    var version: Int16 {
+        origContents.load(fromByteOffset: 0x4, as: Int16.self)
+    }
+
+    var headerSize: Int8 {
+        if version == 0x1 {
+            return Self.MIN_SIZE
+        }
+
+        return origContents.load(fromByteOffset: 0x7, as: Int8.self)
+    }
+
+    var dataLength: Int64 {
+        origContents.load(fromByteOffset: 0x8, as: Int64.self)
+    }
+
+    var encryptedPages: Int64 {
+        origContents.load(fromByteOffset: 0x10, as: Int64.self)
+    }
+
+    var rawDataBuf: UnsafeMutableRawBufferPointer {
+        let dataStart = remappedContents.baseAddress!.advanced(by: Int(headerSize))
+        return UnsafeMutableRawBufferPointer(start: dataStart, count: Int(dataLength))
+    }
+
+    var data: NSData {
+        let dataStart = remappedContents.baseAddress!.advanced(by: Int(headerSize))
+        return NSData(bytesNoCopy: dataStart, length: Int(dataLength), freeWhenDone: false)
+    }
+
+    var description: String {
+        return "<\(type(of: self)): version = \(version); headerSize = \(headerSize); dataLen = \(dataLength); encryptedPages = \(encryptedPages)>"
+    }
+
+    init(path: String) throws {
+        var statBuf = stat()
+        path.withCString { cPath in
+            _ = stat(cPath, &statBuf)
+        }
+        let size = Int(statBuf.st_size)
+
+        if size < Self.MIN_SIZE {
+            throw NSError(domain: NSPOSIXErrorDomain, code:Int(EINVAL))
+        }
+
+        fd = path.withCString { open($0, 0) }
+        if fd == -1 {
+            throw NSError(domain: NSPOSIXErrorDomain, code:Int(errno))
+        }
+
+        let contentsPtr = mmap(nil, size, 1, 2, fd, 0)
+        if contentsPtr == UnsafeMutableRawPointer(bitPattern: -1) {
+            close(fd)
+
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        }
+
+        let remappedPtr = mmap(nil, size, 1, 2, fd, 0)
+        if remappedPtr == UnsafeMutableRawPointer(bitPattern: -1) {
+            munmap(contentsPtr, size)
+            close(fd)
+
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        }
+
+        origContents = UnsafeMutableRawBufferPointer(start: contentsPtr, count: size)
+        remappedContents = UnsafeMutableRawBufferPointer(start: remappedPtr, count: size)
+
+        let magic = origContents.load(as: Int32.self)
+        if magic != _OSSwapInt32(0x4C4D4E45) {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
+        }
+    }
+
+    deinit {
+        munmap(origContents.baseAddress!, origContents.count)
+        munmap(remappedContents.baseAddress!, remappedContents.count)
+        close(fd)
+    }
+
+    func decrypt() throws {
+        if encryptedPages == 0 {
+            return
+        }
+
+        if mremap_encrypted(remappedContents.baseAddress!, remappedContents.count, 0x2, 0xABCD, 0) != 0 {
+            throw  NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        }
+    }
+}
+
+class MLEncryptionInfo: MLEncryptedFile {
+    var keyID: String {
+        let keyIdLen = rawDataBuf.load(fromByteOffset: 0x0, as: Int64.self)
+        let keyIDStart = rawDataBuf.baseAddress!.advanced(by: MemoryLayout<Int64>.size)
+
+        return NSString(bytes: keyIDStart, length: Int(keyIdLen), encoding: NSUTF8StringEncoding)! as String
     }
 }
