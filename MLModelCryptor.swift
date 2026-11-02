@@ -50,13 +50,15 @@ extension URL {
             }
 
             do {
-                let file = try MLEncryptedFile(path: sourceURL.path)
-                try file.decrypt()
+                try autoreleasepool {
+                    let file = try MLEncryptedFile(path: sourceURL.path)
+                    let decryped = try file.decrypt()
 
-                let targetFileURL = outDir.appendingPathComponent(relFilePath)
-                try fm.createDirectory(at: targetFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    let targetFileURL = outDir.appendingPathComponent(relFilePath)
+                    try fm.createDirectory(at: targetFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-                try file.data.write(to: targetFileURL)
+                    try decryped.write(to: targetFileURL)
+                }
 
                 print("Decrypted \(sourceURL.path)")
             } catch {
@@ -81,7 +83,6 @@ extension URL {
         let response = try cloudSession.fetchKeyResponseFromServer(forKeyID: cryptKeyID, signedKeyRequest: request)
 
         let keyBlob = try fpsession.generatePersistentKeyBlob(fromKeyResponse: response)
-
         try MLPersistentKeyStorage.storeKeyBlob(keyBlob, forKeyIdentifier: cryptKeyID)
 
         return keyBlob
@@ -94,36 +95,15 @@ class MLEncryptedFile: CustomStringConvertible {
     private let fd: Int32
 
     let origContents: UnsafeMutableRawBufferPointer
-    let remappedContents: UnsafeMutableRawBufferPointer
 
-    var version: Int16 {
-        origContents.load(fromByteOffset: 0x4, as: Int16.self)
-    }
-
-    var headerSize: Int8 {
-        if version == 0x1 {
-            return Self.MIN_SIZE
-        }
-
-        return origContents.load(fromByteOffset: 0x7, as: Int8.self)
-    }
-
-    var dataLength: Int64 {
-        origContents.load(fromByteOffset: 0x8, as: Int64.self)
-    }
-
-    var encryptedPages: Int64 {
-        origContents.load(fromByteOffset: 0x10, as: Int64.self)
-    }
+    let version: Int16
+    let headerSize: Int8
+    let dataLength: Int64
+    let encryptedPages: Int64
 
     var rawDataBuf: UnsafeMutableRawBufferPointer {
-        let dataStart = remappedContents.baseAddress!.advanced(by: Int(headerSize))
+        let dataStart = origContents.baseAddress!.advanced(by: Int(headerSize))
         return UnsafeMutableRawBufferPointer(start: dataStart, count: Int(dataLength))
-    }
-
-    var data: NSData {
-        let dataStart = remappedContents.baseAddress!.advanced(by: Int(headerSize))
-        return NSData(bytesNoCopy: dataStart, length: Int(dataLength), freeWhenDone: false)
     }
 
     var description: String {
@@ -146,51 +126,58 @@ class MLEncryptedFile: CustomStringConvertible {
             throw NSError(domain: NSPOSIXErrorDomain, code:Int(errno))
         }
 
-        let contentsPtr = mmap(nil, size, 1, 2, fd, 0)
+        let contentsPtr = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0)
         if contentsPtr == UnsafeMutableRawPointer(bitPattern: -1) {
             close(fd)
 
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
-        }
-
-        let remappedPtr = mmap(nil, size, 1, 2, fd, 0)
-        if remappedPtr == UnsafeMutableRawPointer(bitPattern: -1) {
-            munmap(contentsPtr, size)
-            close(fd)
-
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+            throw NSError(domain: NSPOSIXErrorDomain, code:Int(errno))
         }
 
         origContents = UnsafeMutableRawBufferPointer(start: contentsPtr, count: size)
-        remappedContents = UnsafeMutableRawBufferPointer(start: remappedPtr, count: size)
 
         let magic = origContents.load(as: Int32.self)
         if magic != _OSSwapInt32(0x4C4D4E45) {
+            munmap(contentsPtr, size)
+            close(fd)
+
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
         }
+
+        version = origContents.load(fromByteOffset: 0x4, as: Int16.self)
+
+        if version == 0x1 {
+            headerSize = Self.MIN_SIZE
+        } else {
+            headerSize = origContents.load(fromByteOffset: 0x7, as: Int8.self)
+        }
+
+        dataLength = origContents.load(fromByteOffset: 0x8, as: Int64.self)
+        encryptedPages = origContents.load(fromByteOffset: 0x10, as: Int64.self)
     }
 
     deinit {
         munmap(origContents.baseAddress!, origContents.count)
-        munmap(remappedContents.baseAddress!, remappedContents.count)
         close(fd)
     }
 
-    func decrypt() throws {
-        if encryptedPages == 0 {
-            return
+    func decrypt() throws -> Data {
+        let rawData = rawDataBuf
+
+        if encryptedPages != 0 {
+            if mremap_encrypted(origContents.baseAddress!, Int(encryptedPages) << 0xC, 0x2, 0xABCD, 0) != 0 {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+            }
         }
 
-        if mremap_encrypted(remappedContents.baseAddress!, remappedContents.count, 0x2, 0xABCD, 0) != 0 {
-            throw  NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
-        }
+        return NSData(bytesNoCopy: rawData.baseAddress!, length: rawData.count, freeWhenDone: false) as Data
     }
 }
 
 class MLEncryptionInfo: MLEncryptedFile {
     var keyID: String {
-        let keyIdLen = rawDataBuf.load(fromByteOffset: 0x0, as: Int64.self)
-        let keyIDStart = rawDataBuf.baseAddress!.advanced(by: MemoryLayout<Int64>.size)
+        let rawData = rawDataBuf
+        let keyIdLen = rawData.load(fromByteOffset: 0x0, as: Int64.self)
+        let keyIDStart = rawData.baseAddress!.advanced(by: MemoryLayout<Int64>.size)
 
         return NSString(bytes: keyIDStart, length: Int(keyIdLen), encoding: NSUTF8StringEncoding)! as String
     }

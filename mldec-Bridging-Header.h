@@ -11,9 +11,7 @@ int mremap_encrypted(void* addr, size_t len, uint32_t cryptid, uint32_t cputype,
 @end
 
 @interface MLFairPlayKeyLoadingSession: NSObject
-- (NSData *)generateKeyRequestForKeyIdentifier:(NSString *)keyID error:(NSError *__autoreleasing *)error;
 - (NSData *)generateKeyRequestForKeyIdentifier:(NSString *)keyID teamIdentifier:(NSString *)teamID error:(NSError *__autoreleasing *)error;
-
 - (NSData *)generatePersistentKeyBlobFromKeyResponse:(NSData *)response error:(NSError *__autoreleasing *)error;
 @end
 
@@ -26,10 +24,5 @@ int mremap_encrypted(void* addr, size_t len, uint32_t cryptid, uint32_t cputype,
 + (BOOL)storeKeyBlob:(nonnull NSData *)keyBlob forKeyIdentifier:(nonnull NSString *)keyID error:(NSError *__autoreleasing *)error;
 + (nullable NSData *)retrieveKeyBlobForKeyIdentifier:(NSString *)keyID;
 @end
-
-@interface MLKeyManager: NSObject
-+ (id)decryptSessionForModelAtURL:(NSURL *)URL error:(NSError *__autoreleasing *)error;
-@end
-
 
 #endif /* BridgingHeader_h */
